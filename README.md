@@ -1,6 +1,6 @@
 # CMVP checker
 
-Rust CLI for searching CMVP modules by algorithm.
+Rust CLI for searching CMVP modules by algorithm and ESV certificates by IID claim.
 
 It uses two paths:
 
@@ -29,6 +29,14 @@ Search active modules:
 ./target/release/cmvp-checker ML-KEM LMS --status Active
 ```
 
+Search ESV certificates by IID claim:
+
+```bash
+./target/release/cmvp-checker esv --iid iid
+./target/release/cmvp-checker esv --iid non-iid
+./target/release/cmvp-checker esv --iid unknown
+```
+
 Write structured output:
 
 ```bash
@@ -42,11 +50,14 @@ The tool stores cached data in `./cmvp_search_cache` by default:
 
 - `certificates/` - cached CMVP certificate HTML pages
 - `security-policies/` - cached policy PDFs and extracted `.txt` files
+- `esv-certificates/` - cached ESV certificate HTML pages
+- `entropy-documents/` - cached ESV public-use documents and extracted `.txt` files
 
 Refresh cached certificate pages and security policies:
 
 ```bash
 ./target/release/cmvp-checker ML-KEM --fresh
+./target/release/cmvp-checker esv --iid iid --fresh
 ```
 
 Use an existing cache directory:
@@ -61,6 +72,7 @@ If you already have cached certificate HTML and policy text, you can avoid live 
 
 ```bash
 ./target/release/cmvp-checker --offline --cache-dir /tmp/cmvp_search_cache ML-KEM LMS
+./target/release/cmvp-checker esv --offline --cache-dir /tmp/cmvp_search_cache --iid non-iid
 ```
 
 Offline mode skips live CMVP/CAVP lookups and scans only the cached files.
@@ -82,3 +94,12 @@ Example:
 5247 | Geomys LLC | Go Cryptographic Module | A6650 | ML-KEM EncapDecap | EncapDecap
 5247 | Geomys LLC | Go Cryptographic Module | A6650 | ML-KEM KeyGen     | KeyGen
 ```
+
+For ESV searches, the tool reports:
+
+- **Certificate**
+- **Vendor**
+- **Implementation**
+- **IID Claim**
+- **Noise Source**
+- **Validated**
