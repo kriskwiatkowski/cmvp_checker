@@ -143,6 +143,12 @@ impl IidClaim {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct IidAnalysis {
+    claim: IidClaim,
+    non_iid_confidence: u8,
+}
+
 #[derive(Copy, Clone, Debug)]
 enum OutputKind {
     Cmvp,
@@ -169,6 +175,7 @@ struct ResultRow {
     esv_reuse_status: String,
     entropy_document_url: String,
     iid_claim: IidClaim,
+    non_iid_confidence: u8,
 }
 
 #[derive(Serialize)]
@@ -273,7 +280,15 @@ fn run_esv_search(client: &Client, args: &EsvArgs) -> Result<Vec<SearchOutcome>>
         .into_iter()
         .filter(|row| row.iid_claim.matches_filter(args.iid))
         .collect();
-    rows.sort_by(|a, b| b.module_certificate.cmp(&a.module_certificate));
+    if args.iid == IidClaimFilter::Unknown {
+        rows.sort_by(|a, b| {
+            b.non_iid_confidence
+                .cmp(&a.non_iid_confidence)
+                .then_with(|| b.module_certificate.cmp(&a.module_certificate))
+        });
+    } else {
+        rows.sort_by(|a, b| b.module_certificate.cmp(&a.module_certificate));
+    }
 
     let results_message = format!(
         "Scanned {scanned_certificates} ESV certificates; matched {} with IID filter '{}' ({} unknown).",
@@ -937,38 +952,216 @@ fn fetch_esv_catalog(client: &Client, cache_dir: &Path, offline: bool) -> Result
     Ok(dedupe_rows(rows))
 }
 
-fn classify_iid_claim(pdf_text: &str) -> Result<IidClaim> {
-    let text = pdf_text.replace('\u{c}', "\n");
+fn normalize_classifier_text(text: &str) -> String {
+    text.replace('\u{c}', "\n")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn classifier_blocks(text: &str) -> Result<Vec<String>> {
+    let raw = text.replace('\u{c}', "\n");
+    let split_re = Regex::new(r"\n\s*\n+")?;
+    let blocks: Vec<String> = split_re
+        .split(&raw)
+        .map(normalize_classifier_text)
+        .filter(|block| !block.is_empty())
+        .collect();
+    Ok(if blocks.is_empty() {
+        vec![normalize_classifier_text(text)]
+    } else {
+        blocks
+    })
+}
+
+fn classifier_sentences(text: &str) -> Result<Vec<String>> {
+    let normalized = normalize_classifier_text(text);
+    let mut sentences = Vec::new();
+    let mut start = 0usize;
+    for (index, ch) in normalized.char_indices() {
+        if matches!(ch, '.' | '!' | '?') {
+            let sentence = normalize_classifier_text(&normalized[start..=index]);
+            if !sentence.is_empty() {
+                sentences.push(sentence);
+            }
+            start = index + ch.len_utf8();
+        }
+    }
+    if start < normalized.len() {
+        let sentence = normalize_classifier_text(&normalized[start..]);
+        if !sentence.is_empty() {
+            sentences.push(sentence);
+        }
+    }
+    Ok(if sentences.is_empty() {
+        vec![normalized]
+    } else {
+        sentences
+    })
+}
+
+fn matches_any_pattern(text: &str, patterns: &[&str]) -> Result<bool> {
+    for pattern in patterns {
+        if Regex::new(pattern)?.is_match(text) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn score_pattern_weights(texts: &[String], patterns: &[(&str, u8)]) -> Result<u8> {
+    let mut score = 0u8;
+    for (pattern, weight) in patterns {
+        let regex = Regex::new(pattern)?;
+        if texts.iter().any(|text| regex.is_match(text)) {
+            score = score.saturating_add(*weight);
+        }
+    }
+    Ok(score)
+}
+
+fn analyze_iid_claim(pdf_text: &str) -> Result<IidAnalysis> {
+    let text = normalize_classifier_text(pdf_text);
     let structured_track_re =
-        Regex::new(r"(?is)\bEntropy\s+Estimation\s+Track\b.{0,120}?\b(Non[-\s]?IID|IID)\b")?;
+        Regex::new(r"(?i)\bEntropy\s+Estimation\s+Track\b.{0,120}?\b(Non[-\s]?IID|IID)\b")?;
     if let Some(captures) = structured_track_re.captures(&text) {
         let value = captures
             .get(1)
             .map(|capture| capture.as_str())
             .unwrap_or_default();
-        return Ok(if value.to_ascii_lowercase().starts_with("non") {
-            IidClaim::NonIid
-        } else {
-            IidClaim::Iid
+        return Ok(IidAnalysis {
+            claim: if value.to_ascii_lowercase().starts_with("non") {
+                IidClaim::NonIid
+            } else {
+                IidClaim::Iid
+            },
+            non_iid_confidence: if value.to_ascii_lowercase().starts_with("non") {
+                100
+            } else {
+                0
+            },
         });
     }
 
     let narrative_track_re = Regex::new(
-        r"(?is)\bThe\s+(Non[-\s]?IID|IID)\s+entropy\s+estimation\s+track\s+is\s+chosen\b",
+        r"(?i)\bThe\s+(Non[-\s]?IID|IID)\s+entropy\s+estimation\s+track\s+is\s+chosen\b",
     )?;
     if let Some(captures) = narrative_track_re.captures(&text) {
         let value = captures
             .get(1)
             .map(|capture| capture.as_str())
             .unwrap_or_default();
-        return Ok(if value.to_ascii_lowercase().starts_with("non") {
-            IidClaim::NonIid
-        } else {
-            IidClaim::Iid
+        return Ok(IidAnalysis {
+            claim: if value.to_ascii_lowercase().starts_with("non") {
+                IidClaim::NonIid
+            } else {
+                IidClaim::Iid
+            },
+            non_iid_confidence: if value.to_ascii_lowercase().starts_with("non") {
+                100
+            } else {
+                0
+            },
         });
     }
 
-    Ok(IidClaim::Unknown)
+    let explicit_non_iid_patterns = [
+        r"(?i)\bmakes\s+no\s+IID\s+claim\b",
+        r"(?i)\brequirements\s+for\s+a\s+non[-\s]?IID\s+entropy\s+source\b",
+        r"(?i)\bnon[-\s]?IID\s+entropy\s+source\b",
+        r"(?i)\bnon[-\s]?independent\s+and\s+identically\s+distributed\s*\(non[-\s]?IID\)\b",
+        r"(?i)\bnon[-\s]?independent\s+and\s+identically\s+distributed\b",
+        r"(?i)\bthis\s+is\s+a\s+non[-\s]?IID\s+entropy\s+source\b",
+        r"(?i)\btested\s+under\s+the\s+assumption\s+that\s+(?:the\s+)?output\s+is\s+non[-\s]?IID\b",
+        r"(?i)\bclaims\s+non[-\s]?IID\s+track\b",
+        r"(?i)\bfollows\s+the\s+non[-\s]?IID\s+track\b",
+    ];
+    let explicit_iid_patterns = [
+        r"(?i)(^|[^A-Za-z-])IID\s+Entropy\s+Source\b",
+        r"(?i)\bmeets\s+all\s+requirements\s+for\s+IID\s+compliance\b",
+        r"(?i)\bthe\s+IID\s+claim\b",
+        r"(?i)\bunder\s+the\s+IID\s+claim\b",
+        r"(?i)\bPassed\s+IID\s+permutation\s+tests\b",
+        r"(?i)\bTest\s+Results\s+for\s+IID\s+assessment\b",
+        r"(?i)\bNIST\s+IID\s+test\s+tool\s+gives\s+pass\s+results\b",
+    ];
+
+    let keyword_re = Regex::new(
+        r"(?i)\b(iid|non[-\s]?iid|entropy\s+source|entropy\s+estimation\s+track|claim|compliance|track|tests?)\b",
+    )?;
+    let mut contexts: Vec<String> = classifier_sentences(pdf_text)?
+        .into_iter()
+        .filter(|sentence| keyword_re.is_match(sentence))
+        .collect();
+    contexts.extend(
+        classifier_blocks(pdf_text)?
+            .into_iter()
+            .filter(|block| keyword_re.is_match(block)),
+    );
+    if contexts.is_empty() {
+        contexts.push(text.clone());
+    }
+
+    let mut saw_non_iid = false;
+    for context in &contexts {
+        if matches_any_pattern(context, &explicit_non_iid_patterns)? {
+            if matches_any_pattern(context, &explicit_iid_patterns)? {
+                return Ok(IidAnalysis {
+                    claim: IidClaim::Iid,
+                    non_iid_confidence: 0,
+                });
+            }
+            saw_non_iid = true;
+        }
+    }
+    if saw_non_iid {
+        return Ok(IidAnalysis {
+            claim: IidClaim::NonIid,
+            non_iid_confidence: 100,
+        });
+    }
+
+    for context in &contexts {
+        if matches_any_pattern(context, &explicit_iid_patterns)? {
+            return Ok(IidAnalysis {
+                claim: IidClaim::Iid,
+                non_iid_confidence: 0,
+            });
+        }
+    }
+
+    let weak_non_iid_patterns = [
+        (r"(?i)\bnon[-\s]?IID\s+tests?\b", 18),
+        (r"(?i)\bnon[-\s]?IID\s+track\b", 24),
+        (
+            r"(?i)\brequirements\s+for\s+non[-\s]?IID\s+compliance\b",
+            24,
+        ),
+        (r"(?i)\bSP\s*800-?90B.{0,40}non[-\s]?IID\b", 12),
+        (r"(?i)\boutput\s+is\s+non[-\s]?IID\b", 24),
+        (r"(?i)\bassumption.{0,60}non[-\s]?IID\b", 20),
+    ];
+    let weak_iid_patterns = [
+        (r"(?i)\bIID\s+tests?\b", 10),
+        (r"(?i)\bIID\s+assessment\b", 14),
+        (r"(?i)\bIID\s+restart\s+tests\b", 14),
+        (r"(?i)\bIID\s+random\s+tests\b", 14),
+        (r"(?i)\bIID\s+permutation\s+tests\b", 14),
+        (r"(?i)\bIndependent\s+and\s+Identically\s+Distributed\b", 8),
+    ];
+    let non_iid_score = score_pattern_weights(&contexts, &weak_non_iid_patterns)?;
+    let iid_score = score_pattern_weights(&contexts, &weak_iid_patterns)?;
+    let confidence = (50i16 + i16::from(non_iid_score) - i16::from(iid_score)).clamp(0, 100) as u8;
+
+    Ok(IidAnalysis {
+        claim: IidClaim::Unknown,
+        non_iid_confidence: confidence,
+    })
+}
+
+#[cfg(test)]
+fn classify_iid_claim(pdf_text: &str) -> Result<IidClaim> {
+    Ok(analyze_iid_claim(pdf_text)?.claim)
 }
 
 fn enrich_esv_certificate(
@@ -985,6 +1178,9 @@ fn enrich_esv_certificate(
         fresh,
     )?;
     let mut enriched = parse_esv_certificate_html(&certificate_html, &row.module_certificate)?;
+    if enriched.iid_claim == IidClaim::Unknown {
+        enriched.non_iid_confidence = 50;
+    }
     if !enriched.vendor.is_empty() {
         enriched.vendor = enriched.vendor.trim().to_string();
     } else {
@@ -1008,7 +1204,9 @@ fn enrich_esv_certificate(
             &enriched.entropy_document_url,
             fresh,
         )?;
-        enriched.iid_claim = classify_iid_claim(&pdf_text)?;
+        let analysis = analyze_iid_claim(&pdf_text)?;
+        enriched.iid_claim = analysis.claim;
+        enriched.non_iid_confidence = analysis.non_iid_confidence;
     }
     Ok(enriched)
 }
@@ -1525,20 +1723,29 @@ fn render_table(outcome: &SearchOutcome) {
                 "Vendor",
                 "Implementation",
                 "IID Claim",
+                "Non-IID %",
                 "Noise Source",
                 "Validated",
+                "Link",
             ];
             rows = outcome
                 .rows
                 .iter()
                 .map(|row| {
+                    let link = if row.entropy_document_url.is_empty() {
+                        row.certificate_url.clone()
+                    } else {
+                        row.entropy_document_url.clone()
+                    };
                     vec![
                         row.module_certificate.clone(),
                         row.vendor.clone(),
                         row.module_name.clone(),
                         row.iid_claim.as_str().to_string(),
+                        format!("{}%", row.non_iid_confidence),
                         row.esv_noise_source.clone(),
                         row.validation_date.clone(),
+                        link,
                     ]
                 })
                 .collect();
@@ -1609,6 +1816,7 @@ fn write_csv(path: &Path, outcomes: &[SearchOutcome]) -> Result<()> {
         "esv_reuse_status",
         "entropy_document_url",
         "iid_claim",
+        "non_iid_confidence",
     ])?;
     for outcome in outcomes {
         for row in &outcome.rows {
@@ -1637,6 +1845,7 @@ fn write_csv(path: &Path, outcomes: &[SearchOutcome]) -> Result<()> {
                 row.esv_reuse_status.as_str(),
                 row.entropy_document_url.as_str(),
                 row.iid_claim.as_str(),
+                &row.non_iid_confidence.to_string(),
             ])?;
         }
     }
@@ -1656,4 +1865,66 @@ fn write_json(path: &Path, outcomes: &[SearchOutcome]) -> Result<()> {
         .collect();
     fs::write(path, serde_json::to_vec_pretty(&payload)?)
         .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IidClaim, analyze_iid_claim, classify_iid_claim};
+
+    #[test]
+    fn classifies_structured_non_iid_track() {
+        let text = "Entropy Estimation Track (per SP 800-90B §3.1.2)\n\nNon-IID";
+        assert_eq!(classify_iid_claim(text).unwrap(), IidClaim::NonIid);
+    }
+
+    #[test]
+    fn classifies_iid_claim_language() {
+        let text = "Under the IID claim, the NIST IID test tool gives pass results.";
+        assert_eq!(classify_iid_claim(text).unwrap(), IidClaim::Iid);
+    }
+
+    #[test]
+    fn classifies_iid_entropy_source_title() {
+        let text = "Futurex Cryptographic Module IID Entropy Source\nPublic Use Document";
+        assert_eq!(classify_iid_claim(text).unwrap(), IidClaim::Iid);
+    }
+
+    #[test]
+    fn classifies_iid_compliance_language() {
+        let text = "YDK QRNG Entropy Source is a physical entropy source based on quantum noise. It meets all requirements for IID compliance.";
+        assert_eq!(classify_iid_claim(text).unwrap(), IidClaim::Iid);
+    }
+
+    #[test]
+    fn classifies_explicit_non_iid_narrative() {
+        let text = "Kernel CPU Jitter RNG makes no IID claim and thus meets all the requirements for a non-IID entropy source.";
+        assert_eq!(classify_iid_claim(text).unwrap(), IidClaim::NonIid);
+    }
+
+    #[test]
+    fn does_not_treat_non_iid_entropy_source_as_iid() {
+        let text = "The EIP-76 TRNG is a physical SP 800-90B compliant non-IID entropy source used in the module.";
+        assert_eq!(classify_iid_claim(text).unwrap(), IidClaim::NonIid);
+    }
+
+    #[test]
+    fn classifies_non_independent_phrase_as_non_iid() {
+        let text = "The entropic data from the entropy source is Non-Independent and Identically Distributed (IID).";
+        assert_eq!(classify_iid_claim(text).unwrap(), IidClaim::NonIid);
+    }
+
+    #[test]
+    fn keeps_ambiguous_iid_mentions_unknown() {
+        let text =
+            "The document includes IID as a glossary term and discusses IID testing generally.";
+        assert_eq!(classify_iid_claim(text).unwrap(), IidClaim::Unknown);
+    }
+
+    #[test]
+    fn estimates_unknown_as_likely_non_iid_from_sentence_context() {
+        let text = "The measured lower bound for the min entropy per bit, as given by the non-IID tests in SP 800-90B, is 0.85. The entropy source produces 256-bit output samples.";
+        let analysis = analyze_iid_claim(text).unwrap();
+        assert_eq!(analysis.claim, IidClaim::Unknown);
+        assert!(analysis.non_iid_confidence > 50);
+    }
 }

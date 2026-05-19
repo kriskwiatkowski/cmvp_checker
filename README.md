@@ -101,5 +101,7 @@ For ESV searches, the tool reports:
 - **Vendor**
 - **Implementation**
 - **IID Claim**
+- **Non-IID %** - heuristic confidence that an `unknown` result is actually non-IID
 - **Noise Source**
 - **Validated**
+- **Link** - public-use document URL when available, otherwise the certificate page
